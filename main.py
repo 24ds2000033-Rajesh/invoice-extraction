@@ -1,4 +1,5 @@
 import os
+import traceback
 from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -6,81 +7,99 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 
-# Initialize FastAPI application
+# 1. Initialize FastAPI application
 app = FastAPI(title="IITM Finance Invoice Extractor API")
 
-# Enable CORS so Cloudflare Workers or Graders can call the endpoint seamlessly
+# 2. Enable CORS globally so the Cloudflare Worker grader can access it
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],  
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods (POST, GET, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],  
+    allow_headers=["*"],  
 )
 
-# Initialize the Gemini Client
-# Ensure GEMINI_API_KEY environment variable is set before running
+# 3. Initialize the GenAI Client safely
+# We read the environment variable directly to provide explicit errors if it's missing
+api_key = os.environ.get("GEMINI_API_KEY")
+if not api_key:
+    print("\n[CRITICAL WARNING]: GEMINI_API_KEY environment variable is not set!")
+    print("Please set it using: export GEMINI_API_KEY='your_key'\n")
+
 client = genai.Client()
 
-# Define the Incoming Request Payload Schema
+# 4. Define Request Schema
 class InvoiceRequest(BaseModel):
     invoice_text: str
 
-# Define the Mandatory Output Schema requested by the spec
+# 5. Define Mandatory Output Schema (Enforcing strict key presence and types)
 class InvoiceResponse(BaseModel):
-    invoice_no: Optional[str] = Field(default=None, description="The invoice number/reference string.")
+    invoice_no: Optional[str] = Field(default=None, description="The alphanumeric invoice number or reference code.")
     date: Optional[str] = Field(
         default=None, 
-        description="The invoice issue date strictly formatted as an ISO string YYYY-MM-DD. Convert words like '15 March 2026' to '2026-03-15'."
+        description="The invoice date normalized to ISO format YYYY-MM-DD. Convert textual months (e.g., '15 March 2026' to '2026-03-15')."
     )
-    vendor: Optional[str] = Field(default=None, description="The name of the vendor/issuing company.")
-    amount: Optional[float] = Field(default=None, description="The subtotal before any taxes are added.")
-    tax: Optional[float] = Field(default=None, description="The isolated tax or GST amount only.")
-    currency: Optional[str] = Field(default=None, description="The 3-letter currency code, e.g., INR, USD.")
+    vendor: Optional[str] = Field(default=None, description="The name of the vendor or company issuing the invoice.")
+    amount: Optional[float] = Field(default=None, description="The subtotal value of items BEFORE tax or GST is added.")
+    tax: Optional[float] = Field(default=None, description="The isolated tax or GST amount only. Do not include subtotal or grand total.")
+    currency: Optional[str] = Field(default=None, description="The 3-letter currency code, e.g., INR, USD, EUR.")
+
 
 @app.post("/extract", response_model=InvoiceResponse)
 async def extract_invoice(payload: InvoiceRequest):
-    if not payload.invoice_text.strip():
+    # Quick guard for empty payloads
+    if not payload.invoice_text or not payload.invoice_text.strip():
         raise HTTPException(status_code=400, detail="Invoice text cannot be empty.")
     
-    # Prompt explicitly enforcing structural boundaries
+    # Construction of explicit prompt constraints
     prompt = f"""
-    You are an expert financial parsing assistant for the IITM Finance Cell.
-    Analyze the following raw invoice text and extract the required fields.
+    You are an automated extraction assistant for the IITM Finance Cell.
+    Analyze the provided invoice text and map it directly into the requested JSON schema structure.
     
-    Strict Rules:
-    1. Parse and standardize the 'date' field into exactly 'YYYY-MM-DD'. For example, convert '15 March 2026' to '2026-03-15'.
-    2. 'amount' must represent the subtotal BEFORE taxes.
-    3. 'tax' must represent the tax/GST component amount only. Do not mix it with the grand total.
-    4. If any field cannot be identified or is missing in the text, return null for that field.
+    Strict Guidelines:
+    1. Parse dates cleanly. Convert values like '15 March 2026' or '22/01/2026' strictly into 'YYYY-MM-DD'.
+    2. Separator check: 'amount' must only capture the subtotal before tax. 'tax' must capture the exact tax/GST number.
+    3. If a field cannot be derived, leave it as null. Do not hallucinate values.
 
-    Raw Invoice Text:
+    Invoice Text Content:
     ---
     {payload.invoice_text}
     ---
     """
     
     try:
-        # Call Gemini using Structured Output features
+        # Call Gemini using native structural constraints
         response = client.models.generate_content(
             model='gemini-2.5-flash',
             contents=prompt,
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
                 response_schema=InvoiceResponse,
-                temperature=0.0  # Set to 0 for deterministic, extraction-focused results
+                temperature=0.0  # Force deterministic output
             ),
         )
         
-        # The response text will automatically conform to the Pydantic schema structure
+        # Parse the JSON string coming back from Gemini into our Pydantic model
         parsed_response = InvoiceResponse.model_validate_json(response.text)
         return parsed_response
 
     except Exception as e:
-        # Graceful error handling for API failures
-        raise HTTPException(status_code=500, detail=f"Extraction failed: {str(e)}")
+        # --- VERBOSE LOGGING FOR DEBUGGING 500 ERRORS ---
+        print("\n" + "="*60)
+        print("ERROR DETECTED DURING /extract POST REQUEST")
+        print("="*60)
+        print(f"Exception Type: {type(e).__name__}")
+        print(f"Exception Message: {str(e)}")
+        print("\nFull Execution Traceback:")
+        traceback.print_exc()
+        print("="*60 + "\n")
+        
+        # Bubble up a descriptive error string back to your caller/grader log
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Internal Server Error: [{type(e).__name__}] {str(e)}"
+        )
 
-# Fallback root route for checking deployment health
 @app.get("/")
-def read_root():
+def health_check():
     return {"status": "healthy", "service": "IITM Invoice Extractor"}
